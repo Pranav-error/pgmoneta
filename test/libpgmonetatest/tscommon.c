@@ -761,6 +761,8 @@ write_restore_postgresql_conf(const char* restore_dir, int port)
    fprintf(f, "listen_addresses = '*'\n");
    fprintf(f, "port = %d\n", port);
    fprintf(f, "shared_preload_libraries = ''\n");
+   /* The primary's log file belongs to the primary; pg_ctl -l captures this server's output */
+   fprintf(f, "logging_collector = off\n");
 
    fclose(f);
    return 0;
