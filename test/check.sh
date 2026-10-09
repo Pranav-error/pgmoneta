@@ -706,6 +706,8 @@ fi
 if [[ "$SUBCOMMAND" == "ci" ]]; then
    MODE="ci"
    PORT=5432
+   # The tests may run under `su -`, which drops CI=true; restored backups must use pg_ctl here
+   export PGMONETA_TEST_LOCAL_RESTORE=1
    trap cleanup EXIT SIGINT
    run_tests
    exit 0
