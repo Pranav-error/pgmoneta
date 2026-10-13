@@ -244,7 +244,6 @@ pgmoneta_connect(char* hostname, int port, int* fd)
    struct addrinfo* servinfo = NULL;
    struct addrinfo* p = NULL;
    int yes = 1;
-   size_t buffer_size = DEFAULT_BUFFER_SIZE;
    socklen_t optlen = sizeof(int);
    int rv;
    char sport[6];
@@ -308,26 +307,6 @@ pgmoneta_connect(char* hostname, int port, int* fd)
             }
          }
 
-         if (config != NULL)
-         {
-            if (setsockopt(*fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, optlen) == -1)
-            {
-               error = errno;
-               pgmoneta_disconnect(*fd);
-               errno = 0;
-               *fd = -1;
-               continue;
-            }
-
-            if (setsockopt(*fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, optlen) == -1)
-            {
-               error = errno;
-               pgmoneta_disconnect(*fd);
-               errno = 0;
-               *fd = -1;
-               continue;
-            }
-         }
 
          if (connect(*fd, p->ai_addr, p->ai_addrlen) == -1)
          {
