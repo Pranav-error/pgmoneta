@@ -94,31 +94,14 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rockylinux/rockylinux:10
+      options: --cap-add=SYS_PTRACE
 
     strategy:
       matrix:
-        compiler: [gcc, clang]
-        build_type: [Debug, Release]
+        compiler: [clang]
+        build_type: [Debug]
         pg_version: [14, 15, 17]
-        exclude:
-          - pg_version: 14
-            compiler: gcc
-            build_type: Debug
-          - pg_version: 14
-            compiler: gcc
-            build_type: Release
-          - pg_version: 14
-            compiler: clang
-            build_type: Release
-          - pg_version: 15
-            compiler: gcc
-            build_type: Debug
-          - pg_version: 15
-            compiler: gcc
-            build_type: Release
-          - pg_version: 15
-            compiler: clang
-            build_type: Release
+        repeat: [1, 2, 3]
       fail-fast: false
 
     steps:
@@ -140,7 +123,7 @@ jobs:
             check check-devel llvm \
             libasan libubsan \
             net-tools procps-ng ncurses-devel \
-            util-linux sudo which zstd
+            util-linux sudo which zstd gdb
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -191,8 +174,18 @@ jobs:
         run: |
           export TEST_PG_VERSION=${{ matrix.pg_version }}
           if [ "${{ matrix.compiler }}" = "clang" ] && [ "${{ matrix.build_type }}" = "Debug" ]; then
+            bash .github/hang_watchdog.sh ${{ matrix.pg_version }} &
             su - runner -c "cd $GITHUB_WORKSPACE && export TEST_PG_VERSION=${{ matrix.pg_version }} && export PATH=/usr/pgsql-${{ matrix.pg_version }}/bin:\$PATH && bash ./test/check.sh ci"
           fi
+
+      - name: Upload hang diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: hang-diag-${{ matrix.pg_version }}-${{ matrix.repeat }}
+          path: /tmp/hang-diag
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Report coverage summary
         if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
@@ -207,7 +200,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: coverage-reports-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.pg_version }}
+          name: coverage-reports-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.pg_version }}-${{ matrix.repeat }}
           path: /tmp/pgmoneta-test/coverage
           retention-days: 90
 
@@ -215,7 +208,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: logs-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.pg_version }}
+          name: logs-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.pg_version }}-${{ matrix.repeat }}
           path: /tmp/pgmoneta-test/log
           retention-days: 90
 
