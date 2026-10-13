@@ -19,6 +19,13 @@ while true; do
       echo "== gdb $p: $(tr '\0' ' ' < /proc/$p/cmdline)"
       gdb -batch -p $p -ex 'thread apply all bt' 2>&1 | grep -vE '^\[|^Using host|^warning'
     done
+    echo "== ss (Recv-Q/Send-Q per socket), twice 20 s apart"
+    ss -tanpie; sleep 20; echo "-- 20 s later"; ss -tanpie
+    for p in $(pgrep -f '^pgmoneta: backup'); do
+      echo "== fds of $p"; ls -l /proc/$p/fd
+      for f in /proc/$p/fd/*; do echo "$f: $(grep -E '^flags' /proc/$p/fdinfo/${f##*/} 2>/dev/null)"; done
+      echo "== strace $p (5 s)"; timeout 5 strace -f -tt -p $p 2>&1 | head -40
+    done
     for p in $(pgrep -f 'postgres: (walsender|checkpointer)'); do
       echo "== gdb $p: $(tr '\0' ' ' < /proc/$p/cmdline)"
       gdb -batch -p $p -ex bt 2>&1 | grep -vE '^\[|^Using host|^warning'

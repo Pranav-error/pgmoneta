@@ -123,7 +123,7 @@ jobs:
             check check-devel llvm \
             libasan libubsan \
             net-tools procps-ng ncurses-devel \
-            util-linux sudo which zstd gdb
+            util-linux sudo which zstd gdb strace iproute
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
