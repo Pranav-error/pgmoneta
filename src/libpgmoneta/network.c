@@ -307,7 +307,6 @@ pgmoneta_connect(char* hostname, int port, int* fd)
             }
          }
 
-
          if (connect(*fd, p->ai_addr, p->ai_addrlen) == -1)
          {
             error = errno;
