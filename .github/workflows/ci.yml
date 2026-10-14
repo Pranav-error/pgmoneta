@@ -100,8 +100,8 @@ jobs:
       matrix:
         compiler: [clang]
         build_type: [Debug]
-        pg_version: [14, 15, 17]
-        repeat: [1, 2, 3]
+        pg_version: [14]
+        repeat: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
       fail-fast: false
 
     steps:
