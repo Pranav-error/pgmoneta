@@ -1,11 +1,11 @@
 #!/bin/bash
-# Same steps as the build-linux container job (clang, Debug, PG 14). Exit 99 on a stall.
+# Same steps as the build-linux container job (clang, Debug, PG 15). Exit 99 on a stall.
 set -u
 cd /src && mkdir -p build && cd build && CC=/usr/bin/clang cmake -DCMAKE_BUILD_TYPE=Debug -DDOCS=FALSE .. >/dev/null && make -j$(nproc) >/dev/null || exit 1
 chown -R runner:runner /src
 cat /proc/net/netstat > /tmp/hang-diag/netstat_start.txt
-bash /src/.github/hang_watchdog.sh 14 >/dev/null 2>&1 &
-su - runner -c "cd /src && export TEST_PG_VERSION=14 && export PATH=/usr/pgsql-14/bin:\$PATH && bash ./test/check.sh ci" > /tmp/hang-diag/check.out 2>&1 &
+bash /src/.github/hang_watchdog.sh 15 >/dev/null 2>&1 &
+su - runner -c "cd /src && export TEST_PG_VERSION=15 && export PATH=/usr/pgsql-15/bin:\$PATH && bash ./test/check.sh ci" > /tmp/hang-diag/check.out 2>&1 &
 T=$!
 while kill -0 $T 2>/dev/null; do
   sleep 15
