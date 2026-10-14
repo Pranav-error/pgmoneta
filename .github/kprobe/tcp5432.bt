@@ -1,40 +1,58 @@
-// Kernel view of TCP connections to/from port 5432 (PostgreSQL <-> pgmoneta) on loopback.
-// rx side = pgmoneta socket (remote port 5432). Prints aggregates every 10 s.
+// Per-packet view of the pgmoneta <- PostgreSQL (port 5432) connections: every segment that does NOT
+// arrive in order, every receive-memory refusal, prune, drop and PostgreSQL retransmission, with
+// sequence numbers. rx = pgmoneta socket (remote port 5432), tx = PostgreSQL socket (local port 5432).
+kprobe:tcp_data_queue
+{
+  $sk = (struct sock *)arg0;
+  if (bswap($sk->__sk_common.skc_dport) == 5432) {
+    $tp = (struct tcp_sock *)arg0; $cb = (struct tcp_skb_cb *)((struct sk_buff *)arg1)->cb;
+    if ($cb->seq != $tp->rcv_nxt) {
+      printf("%s rx-ooo  port=%d seq=%u end=%u rcv_nxt=%u copied=%u rmem=%d rcvbuf=%d qlen=%u truesize=%u\n",
+        strftime("%H:%M:%S", nsecs), $sk->__sk_common.skc_num, $cb->seq, $cb->end_seq, $tp->rcv_nxt, $tp->copied_seq,
+        $sk->sk_backlog.rmem_alloc.counter, $sk->sk_rcvbuf, $sk->sk_receive_queue.qlen, ((struct sk_buff *)arg1)->truesize);
+    }
+  }
+}
+kprobe:tcp_try_rmem_schedule
+{
+  $sk = (struct sock *)arg0;
+  if (bswap($sk->__sk_common.skc_dport) == 5432) { @rs_sk[tid] = arg0; @rs_skb[tid] = arg1; }
+}
+kretprobe:tcp_try_rmem_schedule /@rs_sk[tid]/
+{
+  if (retval != 0) {
+    $sk = (struct sock *)@rs_sk[tid]; $tp = (struct tcp_sock *)@rs_sk[tid];
+    $cb = (struct tcp_skb_cb *)((struct sk_buff *)@rs_skb[tid])->cb;
+    printf("%s rx-nomem port=%d seq=%u end=%u rcv_nxt=%u %s rmem=%d rcvbuf=%d qlen=%u truesize=%u\n",
+      strftime("%H:%M:%S", nsecs), $sk->__sk_common.skc_num, $cb->seq, $cb->end_seq, $tp->rcv_nxt,
+      $cb->seq == $tp->rcv_nxt ? "IN-ORDER" : "ooo", $sk->sk_backlog.rmem_alloc.counter, $sk->sk_rcvbuf,
+      $sk->sk_receive_queue.qlen, ((struct sk_buff *)@rs_skb[tid])->truesize);
+  }
+  delete(@rs_sk[tid]); delete(@rs_skb[tid]);
+}
+kprobe:tcp_prune_ofo_queue
+{
+  $sk = (struct sock *)arg0;
+  if (bswap($sk->__sk_common.skc_dport) == 5432) {
+    $tp = (struct tcp_sock *)arg0;
+    printf("%s rx-prune-ofo port=%d rcv_nxt=%u rmem=%d rcvbuf=%d qlen=%u\n", strftime("%H:%M:%S", nsecs),
+      $sk->__sk_common.skc_num, $tp->rcv_nxt, $sk->sk_backlog.rmem_alloc.counter, $sk->sk_rcvbuf, $sk->sk_receive_queue.qlen);
+  }
+}
 tracepoint:skb:kfree_skb
 {
   $skb = (struct sk_buff *)args.skbaddr;
   if ($skb->transport_header == 0xffff) { return; }
   $th = (struct tcphdr *)($skb->head + $skb->transport_header);
-  $s = bswap($th->source); $d = bswap($th->dest);
-  if ($s == 5432 || $d == 5432) {
-    @drop[args.reason, ksym(args.location), $s == 5432 ? "pg->pgmoneta" : "pgmoneta->pg"] = count();
+  if (bswap($th->source) == 5432 && args.reason > 2) {
+    printf("%s rx-drop  port=%d seq=%u reason=%d at %s\n", strftime("%H:%M:%S", nsecs), bswap($th->dest),
+      bswap($th->seq), args.reason, ksym(args.location));
   }
 }
-tracepoint:tcp:tcp_retransmit_skb /args.sport == 5432/ { @retrans_by_pg = count(); }
-kprobe:tcp_try_rmem_schedule
+tracepoint:tcp:tcp_retransmit_skb /args.sport == 5432/
 {
-  $sk = (struct sock *)arg0;
-  if (bswap($sk->__sk_common.skc_dport) == 5432) {
-    $tp = (struct tcp_sock *)arg0; $skb = (struct sk_buff *)arg1;
-    @rs_sk[tid] = arg0;
-    @rs_inorder[tid] = ((struct tcp_skb_cb *)$skb->cb)->seq == $tp->rcv_nxt;
-  }
+  $tp = (struct tcp_sock *)args.skaddr; $cb = (struct tcp_skb_cb *)((struct sk_buff *)args.skbaddr)->cb;
+  printf("%s tx-retrans dport=%d seq=%u end=%u snd_una=%u snd_nxt=%u sacked=%u lost=%u cwnd=%u\n",
+    strftime("%H:%M:%S", nsecs), args.dport, $cb->seq, $cb->end_seq, $tp->snd_una, $tp->snd_nxt,
+    $tp->sacked_out, $tp->lost_out, $tp->snd_cwnd);
 }
-kretprobe:tcp_try_rmem_schedule /@rs_sk[tid]/
-{
-  $sk = (struct sock *)@rs_sk[tid];
-  if (retval != 0) {
-    @rmem_fail[@rs_inorder[tid] ? "in-order" : "out-of-order", $sk->sk_rcvbuf, $sk->sk_userlocks] = count();
-    @rmem_fail_rmem_alloc = stats($sk->sk_backlog.rmem_alloc.counter);
-  }
-  delete(@rs_sk[tid]); delete(@rs_inorder[tid]);
-}
-kprobe:tcp_data_queue_ofo
-{
-  $sk = (struct sock *)arg0;
-  if (bswap($sk->__sk_common.skc_dport) == 5432) { @ofo_enqueue[$sk->sk_rcvbuf, $sk->sk_userlocks] = count(); }
-}
-kprobe:tcp_prune_queue { $sk = (struct sock *)arg0; if (bswap($sk->__sk_common.skc_dport) == 5432) { @prune_queue = count(); } }
-kprobe:tcp_prune_ofo_queue { $sk = (struct sock *)arg0; if (bswap($sk->__sk_common.skc_dport) == 5432) { @prune_ofo = count(); } }
-kprobe:tcp_rcv_space_adjust { $sk = (struct sock *)arg0; if (bswap($sk->__sk_common.skc_dport) == 5432) { @rcvbuf_seen[$sk->sk_rcvbuf, $sk->sk_userlocks] = count(); } }
-interval:s:10 { time("--- %H:%M:%S\n"); print(@drop); print(@retrans_by_pg); print(@rmem_fail); print(@rmem_fail_rmem_alloc); print(@ofo_enqueue); print(@prune_queue); print(@prune_ofo); print(@rcvbuf_seen); clear(@drop); clear(@retrans_by_pg); clear(@rmem_fail); clear(@ofo_enqueue); clear(@prune_queue); clear(@prune_ofo); clear(@rcvbuf_seen); }
