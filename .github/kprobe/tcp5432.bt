@@ -1,0 +1,40 @@
+// Kernel view of TCP connections to/from port 5432 (PostgreSQL <-> pgmoneta) on loopback.
+// rx side = pgmoneta socket (remote port 5432). Prints aggregates every 10 s.
+tracepoint:skb:kfree_skb
+{
+  $skb = (struct sk_buff *)args.skbaddr;
+  if ($skb->transport_header == 0xffff) { return; }
+  $th = (struct tcphdr *)($skb->head + $skb->transport_header);
+  $s = bswap($th->source); $d = bswap($th->dest);
+  if ($s == 5432 || $d == 5432) {
+    @drop[args.reason, ksym(args.location), $s == 5432 ? "pg->pgmoneta" : "pgmoneta->pg"] = count();
+  }
+}
+tracepoint:tcp:tcp_retransmit_skb /args.sport == 5432/ { @retrans_by_pg = count(); }
+kprobe:tcp_try_rmem_schedule
+{
+  $sk = (struct sock *)arg0;
+  if (bswap($sk->__sk_common.skc_dport) == 5432) {
+    $tp = (struct tcp_sock *)arg0; $skb = (struct sk_buff *)arg1;
+    @rs_sk[tid] = arg0;
+    @rs_inorder[tid] = ((struct tcp_skb_cb *)$skb->cb)->seq == $tp->rcv_nxt;
+  }
+}
+kretprobe:tcp_try_rmem_schedule /@rs_sk[tid]/
+{
+  $sk = (struct sock *)@rs_sk[tid];
+  if (retval != 0) {
+    @rmem_fail[@rs_inorder[tid] ? "in-order" : "out-of-order", $sk->sk_rcvbuf, $sk->sk_userlocks] = count();
+    @rmem_fail_rmem_alloc = stats($sk->sk_backlog.rmem_alloc.counter);
+  }
+  delete(@rs_sk[tid]); delete(@rs_inorder[tid]);
+}
+kprobe:tcp_data_queue_ofo
+{
+  $sk = (struct sock *)arg0;
+  if (bswap($sk->__sk_common.skc_dport) == 5432) { @ofo_enqueue[$sk->sk_rcvbuf, $sk->sk_userlocks] = count(); }
+}
+kprobe:tcp_prune_queue { $sk = (struct sock *)arg0; if (bswap($sk->__sk_common.skc_dport) == 5432) { @prune_queue = count(); } }
+kprobe:tcp_prune_ofo_queue { $sk = (struct sock *)arg0; if (bswap($sk->__sk_common.skc_dport) == 5432) { @prune_ofo = count(); } }
+kprobe:tcp_rcv_space_adjust { $sk = (struct sock *)arg0; if (bswap($sk->__sk_common.skc_dport) == 5432) { @rcvbuf_seen[$sk->sk_rcvbuf, $sk->sk_userlocks] = count(); } }
+interval:s:10 { time("--- %H:%M:%S\n"); print(@drop); print(@retrans_by_pg); print(@rmem_fail); print(@rmem_fail_rmem_alloc); print(@ofo_enqueue); print(@prune_queue); print(@prune_ofo); print(@rcvbuf_seen); clear(@drop); clear(@retrans_by_pg); clear(@rmem_fail); clear(@ofo_enqueue); clear(@prune_queue); clear(@prune_ofo); clear(@rcvbuf_seen); }
