@@ -146,3 +146,118 @@ cleanup:
    free(description);
    MCTF_FINISH();
 }
+
+/*
+ * Build a PREPARE main data area the way twophase.c writes it: the on-disk
+ * xl_xact_prepare header, the GID, one delete-on-commit relation, two
+ * dropped stats items and one catcache invalidation (id 7), each MAXALIGN'd.
+ * With truncate set, the record ends before the invalidation.
+ */
+static uint32_t
+build_prepare_record(char* data, int version, bool truncate)
+{
+   struct xl_xact_prepare_v15 hdr;
+   struct rel_file_node rel = {1663, 5, 16390};
+   uint32_t item[4] = {2, 5, 16384, 0}; /* kind, dboid, objid (lo, hi) */
+   size_t item_size = version >= 18 ? 16 : 12;
+   union shared_invalidation_message msg;
+   uint32_t off = 0;
+
+   memset(data, 0, 256);
+   memset(&hdr, 0, sizeof(hdr));
+   hdr.xid = 777;
+   hdr.database = 5;
+   hdr.ncommitrels = 1;
+   hdr.ncommitstats = 2;
+   hdr.ninvalmsgs = 1;
+   hdr.gidlen = 3;
+   memcpy(data, &hdr, sizeof(hdr));
+   off += MAXALIGN(sizeof(hdr));
+
+   memcpy(data + off, "g1", 3);
+   off += MAXALIGN(3);
+
+   memcpy(data + off, &rel, sizeof(rel));
+   off += MAXALIGN(sizeof(rel));
+
+   memcpy(data + off, item, item_size);
+   memcpy(data + off + item_size, item, item_size);
+   off += MAXALIGN(2 * item_size);
+
+   if (truncate)
+   {
+      return off;
+   }
+
+   memset(&msg, 0, sizeof(msg));
+   msg.id = 7;
+   memcpy(data + off, &msg, sizeof(msg));
+   off += MAXALIGN(sizeof(msg));
+
+   return off;
+}
+
+static char*
+describe_prepare(int version, bool truncate)
+{
+   struct server srv;
+   struct server* saved = server_config;
+   struct decoded_xlog_record record;
+   uint64_t data[32];
+   char* description = NULL;
+
+   memset(&srv, 0, sizeof(srv));
+   srv.version = version;
+   server_config = &srv;
+
+   memset(&record, 0, sizeof(record));
+   record.header.xl_rmid = RM_XACT_ID;
+   record.header.xl_info = XLOG_XACT_PREPARE;
+   record.main_data = (char*)data;
+   record.main_data_len = build_prepare_record((char*)data, version, truncate);
+
+   description = pgmoneta_wal_xact_desc(pgmoneta_append(NULL, ""), &record);
+
+   server_config = saved;
+   return description;
+}
+
+MCTF_TEST(test_xact_prepare_gid_rels_stats_invals)
+{
+   int versions[] = {17, 18};
+   char* description = NULL;
+
+   for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++)
+   {
+      description = describe_prepare(versions[i], false);
+      MCTF_ASSERT_PTR_NONNULL(description, cleanup, "prepare was not described");
+      MCTF_ASSERT(strncmp(description, "gid g1: ", 8) == 0, cleanup,
+                  "gid is not read from after the on-disk header");
+      MCTF_ASSERT(strstr(description, "; rels(commit): base/5/16390") != NULL, cleanup,
+                  "commit relations are read from the wrong offset");
+      MCTF_ASSERT(strstr(description, "; inval msgs: catcache 7") != NULL, cleanup,
+                  "invalidations after dropped stats are read from the wrong offset");
+      free(description);
+      description = NULL;
+   }
+
+cleanup:
+   free(description);
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_xact_prepare_truncated)
+{
+   char* description = NULL;
+
+   description = describe_prepare(18, true);
+   MCTF_ASSERT_PTR_NONNULL(description, cleanup, "prepare was not described");
+   MCTF_ASSERT(strstr(description, "; rels(commit): base/5/16390") != NULL, cleanup,
+               "commit relations inside the record are lost");
+   MCTF_ASSERT(strstr(description, "inval msgs") == NULL, cleanup,
+               "invalidations beyond the end of the record are read");
+
+cleanup:
+   free(description);
+   MCTF_FINISH();
+}

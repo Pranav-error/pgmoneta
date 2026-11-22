@@ -39,21 +39,22 @@ static char* xact_desc_relations(char* buf, char* label, int nrels, struct rel_f
 
 static char* xact_desc_commit_v14(char* buf, uint8_t info, struct xl_xact_commit* xlrec, rep_origin_id origin_id);
 static char* xact_desc_abort_v14(char* buf, uint8_t info, struct xl_xact_abort* xlrec);
-static char* xact_desc_prepare_v14(char* buf, uint8_t info, struct xl_xact_prepare_v14* xlrec);
+static char* xact_desc_prepare_v14(char* buf, uint8_t info, struct xl_xact_prepare_v14* xlrec, uint32_t len);
 
 static char* xact_desc_commit_v15(char* buf, uint8_t info, struct xl_xact_commit* xlrec, rep_origin_id origin_id);
 static char* xact_desc_abort_v15(char* buf, uint8_t info, struct xl_xact_abort* xlrec);
-static char* xact_desc_prepare_v15(char* buf, uint8_t info, struct xl_xact_prepare_v15* xlrec);
+static char* xact_desc_prepare_v15(char* buf, uint8_t info, struct xl_xact_prepare_v15* xlrec, uint32_t len);
 
 static char* xact_desc_assignment(char* buf, struct xl_xact_assignment* xlrec);
 static char* xact_desc_subxacts(char* buf, int nsubxacts, transaction_id* subxacts);
 static size_t xact_stats_item_size(void);
+static char* prepare_take(char** ptr, char* end, int32_t count, size_t size);
 
 void parse_abort_record_v14(uint8_t info, struct xl_xact_abort* xlrec, struct xl_xact_parsed_abort_v14* parsed);
 void parse_abort_record_v15(uint8_t info, struct xl_xact_abort* xlrec, struct xl_xact_parsed_abort_v15* parsed);
 
-void parse_prepare_record_v14(uint8_t info, struct xl_xact_prepare_v14* xlrec, xl_xact_parsed_prepare_v14* parsed);
-void parse_prepare_record_v15(uint8_t info, struct xl_xact_prepare_v15* xlrec, xl_xact_parsed_prepare_v15* parsed);
+void parse_prepare_record_v14(uint8_t info, struct xl_xact_prepare_v14* xlrec, uint32_t len, xl_xact_parsed_prepare_v14* parsed);
+void parse_prepare_record_v15(uint8_t info, struct xl_xact_prepare_v15* xlrec, uint32_t len, xl_xact_parsed_prepare_v15* parsed);
 
 void parse_commit_record_v14(uint8_t info, struct xl_xact_commit* xlrec, struct xl_xact_parsed_commit_v14* parsed);
 void parse_commit_record_v15(uint8_t info, struct xl_xact_commit* xlrec, struct xl_xact_parsed_commit_v15* parsed);
@@ -543,11 +544,11 @@ xact_desc_abort_v15(char* buf, uint8_t info, struct xl_xact_abort* xlrec)
 }
 
 static char*
-xact_desc_prepare_v14(char* buf, uint8_t info, struct xl_xact_prepare_v14* xlrec)
+xact_desc_prepare_v14(char* buf, uint8_t info, struct xl_xact_prepare_v14* xlrec, uint32_t len)
 {
    xl_xact_parsed_prepare_v14 parsed;
 
-   parse_prepare_record_v14(info, xlrec, &parsed);
+   parse_prepare_record_v14(info, xlrec, len, &parsed);
 
    buf = pgmoneta_format_and_append(buf, "gid %s: ", parsed.twophase_gid);
    buf = pgmoneta_format_and_append(buf, "%s", pgmoneta_wal_timestamptz_to_str(parsed.xact_time));
@@ -558,15 +559,15 @@ xact_desc_prepare_v14(char* buf, uint8_t info, struct xl_xact_prepare_v14* xlrec
    buf = xact_desc_subxacts(buf, parsed.nsubxacts, parsed.subxacts);
 
    buf = pgmoneta_wal_standby_desc_invalidations(buf, parsed.nmsgs, parsed.msgs, parsed.db_id,
-                                                 parsed.ts_id, xlrec);
+                                                 parsed.ts_id, xlrec->initfileinval);
    return buf;
 }
 static char*
-xact_desc_prepare_v15(char* buf, uint8_t info, struct xl_xact_prepare_v15* xlrec)
+xact_desc_prepare_v15(char* buf, uint8_t info, struct xl_xact_prepare_v15* xlrec, uint32_t len)
 {
    xl_xact_parsed_prepare_v15 parsed;
 
-   parse_prepare_record_v15(info, xlrec, &parsed);
+   parse_prepare_record_v15(info, xlrec, len, &parsed);
 
    buf = pgmoneta_format_and_append(buf, "gid %s: ", parsed.twophase_gid);
    buf = pgmoneta_format_and_append(buf, "%s", pgmoneta_wal_timestamptz_to_str(parsed.xact_time));
@@ -626,6 +627,34 @@ xact_stats_item_size(void)
    return sizeof(struct xl_xact_stats_item);
 }
 
+/*
+ * Return the next count * size bytes of a PREPARE record and step over them,
+ * MAXALIGN'd as twophase.c writes them. Return NULL, and fail every later
+ * call, when they do not fit in the record.
+ */
+static char*
+prepare_take(char** ptr, char* end, int32_t count, size_t size)
+{
+   char* start = *ptr;
+   size_t left;
+
+   if (start == NULL || count < 0)
+   {
+      *ptr = NULL;
+      return NULL;
+   }
+
+   left = (size_t)(end - start);
+   if ((size_t)count * size > left)
+   {
+      *ptr = NULL;
+      return NULL;
+   }
+
+   *ptr = start + MIN(MAXALIGN((size_t)count * size), left);
+   return start;
+}
+
 char*
 pgmoneta_wal_xact_desc(char* buf, struct decoded_xlog_record* record)
 {
@@ -662,12 +691,20 @@ pgmoneta_wal_xact_desc(char* buf, struct decoded_xlog_record* record)
       if (server_config->version >= 15)
       {
          struct xl_xact_prepare_v15* xlrec = (struct xl_xact_prepare_v15*)rec;
-         buf = xact_desc_prepare_v15(buf, XLOG_REC_GET_INFO(record), xlrec);
+         if (XLOG_REC_GET_DATA_LEN(record) < sizeof(struct xl_xact_prepare_v15))
+         {
+            return buf;
+         }
+         buf = xact_desc_prepare_v15(buf, XLOG_REC_GET_INFO(record), xlrec, XLOG_REC_GET_DATA_LEN(record));
       }
       else
       {
          struct xl_xact_prepare_v14* xlrec = (struct xl_xact_prepare_v14*)rec;
-         buf = xact_desc_prepare_v14(buf, XLOG_REC_GET_INFO(record), xlrec);
+         if (XLOG_REC_GET_DATA_LEN(record) < sizeof(struct xl_xact_prepare_v14))
+         {
+            return buf;
+         }
+         buf = xact_desc_prepare_v14(buf, XLOG_REC_GET_INFO(record), xlrec, XLOG_REC_GET_DATA_LEN(record));
       }
    }
    else if (info == XLOG_XACT_ASSIGNMENT)
@@ -779,11 +816,14 @@ parse_abort_record_v14(uint8_t info, struct xl_xact_abort* xlrec, struct xl_xact
 }
 
 void
-parse_prepare_record_v14(uint8_t info __attribute__((unused)), struct xl_xact_prepare_v14* xlrec, xl_xact_parsed_prepare_v14* parsed)
+parse_prepare_record_v14(uint8_t info __attribute__((unused)), struct xl_xact_prepare_v14* xlrec, uint32_t len, xl_xact_parsed_prepare_v14* parsed)
 {
    char* bufptr;
+   char* end = (char*)xlrec + len;
+   char* gid;
 
-   bufptr = ((char*)xlrec) + MAXALIGN(sizeof(struct xl_xact_prepare));
+   /* The GID follows PostgreSQL's on-disk header, not pgmoneta's wrapper struct */
+   bufptr = ((char*)xlrec) + MAXALIGN(sizeof(struct xl_xact_prepare_v14));
 
    memset(parsed, 0, sizeof(*parsed));
 
@@ -792,25 +832,22 @@ parse_prepare_record_v14(uint8_t info __attribute__((unused)), struct xl_xact_pr
    parsed->origin_timestamp = xlrec->origin_timestamp;
    parsed->twophase_xid = xlrec->xid;
    parsed->db_id = xlrec->database;
-   parsed->nsubxacts = xlrec->nsubxacts;
-   parsed->nrels = xlrec->ncommitrels;
-   parsed->nabortrels = xlrec->nabortrels;
-   parsed->nmsgs = xlrec->ninvalmsgs;
 
-   strncpy(parsed->twophase_gid, bufptr, xlrec->gidlen);
-   bufptr += MAXALIGN(xlrec->gidlen);
+   gid = prepare_take(&bufptr, end, xlrec->gidlen, 1);
+   if (gid != NULL)
+   {
+      strncpy(parsed->twophase_gid, gid, MIN((size_t)xlrec->gidlen, sizeof(parsed->twophase_gid) - 1));
+   }
 
-   parsed->subxacts = (transaction_id*)bufptr;
-   bufptr += MAXALIGN(xlrec->nsubxacts * sizeof(transaction_id));
+   parsed->subxacts = (transaction_id*)prepare_take(&bufptr, end, xlrec->nsubxacts, sizeof(transaction_id));
+   parsed->xnodes = (struct rel_file_node*)prepare_take(&bufptr, end, xlrec->ncommitrels, sizeof(struct rel_file_node));
+   parsed->abortnodes = (struct rel_file_node*)prepare_take(&bufptr, end, xlrec->nabortrels, sizeof(struct rel_file_node));
+   parsed->msgs = (union shared_invalidation_message*)prepare_take(&bufptr, end, xlrec->ninvalmsgs, sizeof(union shared_invalidation_message));
 
-   parsed->xnodes = (struct rel_file_node*)bufptr;
-   bufptr += MAXALIGN(xlrec->ncommitrels * sizeof(struct rel_file_node));
-
-   parsed->abortnodes = (struct rel_file_node*)bufptr;
-   bufptr += MAXALIGN(xlrec->nabortrels * sizeof(struct rel_file_node));
-
-   parsed->msgs = (union shared_invalidation_message*)bufptr;
-   bufptr += MAXALIGN(xlrec->ninvalmsgs * sizeof(union shared_invalidation_message));
+   parsed->nsubxacts = parsed->subxacts != NULL ? xlrec->nsubxacts : 0;
+   parsed->nrels = parsed->xnodes != NULL ? xlrec->ncommitrels : 0;
+   parsed->nabortrels = parsed->abortnodes != NULL ? xlrec->nabortrels : 0;
+   parsed->nmsgs = parsed->msgs != NULL ? xlrec->ninvalmsgs : 0;
 }
 
 void
@@ -1008,11 +1045,14 @@ parse_abort_record_v15(uint8_t info, struct xl_xact_abort* xlrec, struct xl_xact
  * ParsePrepareRecord
  */
 void
-parse_prepare_record_v15(uint8_t info __attribute__((unused)), struct xl_xact_prepare_v15* xlrec, xl_xact_parsed_prepare_v15* parsed)
+parse_prepare_record_v15(uint8_t info __attribute__((unused)), struct xl_xact_prepare_v15* xlrec, uint32_t len, xl_xact_parsed_prepare_v15* parsed)
 {
    char* bufptr;
+   char* end = (char*)xlrec + len;
+   char* gid;
 
-   bufptr = ((char*)xlrec) + MAXALIGN(sizeof(struct xl_xact_prepare));
+   /* The GID follows PostgreSQL's on-disk header, not pgmoneta's wrapper struct */
+   bufptr = ((char*)xlrec) + MAXALIGN(sizeof(struct xl_xact_prepare_v15));
 
    memset(parsed, 0, sizeof(*parsed));
 
@@ -1021,31 +1061,25 @@ parse_prepare_record_v15(uint8_t info __attribute__((unused)), struct xl_xact_pr
    parsed->origin_timestamp = xlrec->origin_timestamp;
    parsed->twophase_xid = xlrec->xid;
    parsed->db_id = xlrec->database;
-   parsed->nsubxacts = xlrec->nsubxacts;
-   parsed->nrels = xlrec->ncommitrels;
-   parsed->nabortrels = xlrec->nabortrels;
-   parsed->nmsgs = xlrec->ninvalmsgs;
 
-   strncpy(parsed->twophase_gid, bufptr, xlrec->gidlen);
-   bufptr += MAXALIGN(xlrec->gidlen);
+   gid = prepare_take(&bufptr, end, xlrec->gidlen, 1);
+   if (gid != NULL)
+   {
+      strncpy(parsed->twophase_gid, gid, MIN((size_t)xlrec->gidlen, sizeof(parsed->twophase_gid) - 1));
+   }
 
-   parsed->subxacts = (transaction_id*)bufptr;
-   bufptr += MAXALIGN(xlrec->nsubxacts * sizeof(transaction_id));
+   parsed->subxacts = (transaction_id*)prepare_take(&bufptr, end, xlrec->nsubxacts, sizeof(transaction_id));
+   parsed->xnodes = (struct rel_file_node*)prepare_take(&bufptr, end, xlrec->ncommitrels, sizeof(struct rel_file_node));
+   parsed->abortnodes = (struct rel_file_node*)prepare_take(&bufptr, end, xlrec->nabortrels, sizeof(struct rel_file_node));
 
-   parsed->xnodes = (struct rel_file_node*)bufptr;
-   bufptr += MAXALIGN(xlrec->ncommitrels * sizeof(struct rel_file_node));
+   parsed->stats = (struct xl_xact_stats_item*)prepare_take(&bufptr, end, xlrec->ncommitstats, xact_stats_item_size());
+   parsed->abortstats = (struct xl_xact_stats_item*)prepare_take(&bufptr, end, xlrec->nabortstats, xact_stats_item_size());
+   parsed->msgs = (union shared_invalidation_message*)prepare_take(&bufptr, end, xlrec->ninvalmsgs, sizeof(union shared_invalidation_message));
 
-   parsed->abortnodes = (struct rel_file_node*)bufptr;
-   bufptr += MAXALIGN(xlrec->nabortrels * sizeof(struct rel_file_node));
-
-   parsed->stats = (struct xl_xact_stats_item*)bufptr;
-   bufptr += MAXALIGN(xlrec->ncommitstats * xact_stats_item_size());
-
-   parsed->abortstats = (struct xl_xact_stats_item*)bufptr;
-   bufptr += MAXALIGN(xlrec->nabortstats * xact_stats_item_size());
-
-   parsed->msgs = (union shared_invalidation_message*)bufptr;
-   bufptr += MAXALIGN(xlrec->ninvalmsgs * sizeof(union shared_invalidation_message));
+   parsed->nsubxacts = parsed->subxacts != NULL ? xlrec->nsubxacts : 0;
+   parsed->nrels = parsed->xnodes != NULL ? xlrec->ncommitrels : 0;
+   parsed->nabortrels = parsed->abortnodes != NULL ? xlrec->nabortrels : 0;
+   parsed->nmsgs = parsed->msgs != NULL ? xlrec->ninvalmsgs : 0;
 }
 
 void
